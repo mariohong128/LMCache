@@ -187,10 +187,12 @@ class LMCacheEngine:
         tot_kv_size = 0
         tot_token_num = 0
         t = time.perf_counter()
-
+        # print("begin store func,tokens:",tokens,",mask:",mask)
         for start, end, key in self.token_database.process_tokens(tokens, mask):
+            # print("start:",start,",end:",end,",key:",key)
             assert isinstance(key, CacheEngineKey)
             if self.storage_manager.contains(key):
+                # print("storage_manager key exists")
                 continue
             # Allocate the memory object
             num_tokens = end - start
@@ -380,6 +382,8 @@ class LMCacheEngine:
             num_required_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
+        import time
+        st = time.perf_counter()
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
 
         key_mapping: Dict[str, List[CacheEngineKey]] = {}
@@ -468,6 +472,15 @@ class LMCacheEngine:
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        ed = time.perf_counter()
+        # 统计总的KV大小（以GB为单位）
+        tot_time = ed - st
+        logger.info(
+            "Retrieved %d out of total %d tokens. cost %.4f ms",
+            retrieved_tokens,
+            len(tokens),
+            tot_time * 1000,
+        )
         logger.debug(
             f"Retrieved {retrieved_tokens} "
             f"out of {num_required_tokens} "

@@ -89,6 +89,7 @@ class RequestTracker:
     # Multimodal hashes and positions
     mm_hashes: Optional[list[str]] = None
     mm_positions: Optional[list["PlaceholderRange"]] = None
+    is_decode_phase: bool = False
 
     @staticmethod
     def from_new_request(
@@ -153,7 +154,18 @@ class RequestTracker:
             )
             new_block_ids = new_block_ids[0]
         self.allocated_block_ids.extend(new_block_ids)
+        self._update_decode_phase(new_token_ids)
 
+    def _update_decode_phase(self, new_token_ids: list[int]) -> None:
+        """Update the decode phase based on the new tokens.
+        Args:
+            new_token_ids (list[int]): The new tokens being added to the request.
+        """
+        # Heuristic: Decode phase usually has only one new token
+        if len(new_token_ids) == 1 and len(self.token_ids) > 1:
+            self.is_decode_phase = True
+        else:
+            self.is_decode_phase = False
 
 @dataclass
 class ReqMeta:
@@ -170,12 +182,14 @@ class ReqMeta:
 
     @staticmethod
     def from_request_tracker(
+        lmcache_connector: "LMCacheConnectorV1Impl",
         tracker: RequestTracker,
         block_size: int,
         lmcache_chunk_size: int = 256,
         load_spec: Optional[LoadSpec] = None,
         skip_save: bool = False,
-        discard_partial_chunks: bool = True,
+        discard_partial_chunks: bool = False,
+        force_save: bool = False
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -197,14 +211,23 @@ class ReqMeta:
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
+        # Or this condition is met
+        # 3. if save_decode_cache is False and we are in decode phase
+
+        # Skip save if we're in decode phase and save_decode_cache is False
+        save_decode_cache = lmcache_connector.config.save_decode_cache
         skip_leading_tokens = tracker.num_saved_tokens
         chunk_boundary = (
             cdiv(tracker.num_saved_tokens + 1, lmcache_chunk_size) * lmcache_chunk_size
         )
         skip_save = skip_save or (
             tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary
+            or (tracker.is_decode_phase and not save_decode_cache)
         )
-
+        if tracker.is_decode_phase and skip_save and input_token_len < chunk_boundary and force_save:
+            skip_save = False
+        # print("tracker.num_saved_tokens:",tracker.num_saved_tokens)
+        # print("force_save:",force_save,"tracker.is_decode_phase:",tracker.is_decode_phase,",skip_save:",skip_save,",load_spec:",load_spec)
         if skip_save and load_spec is None:
             return None
 
@@ -304,7 +327,7 @@ class LMCacheConnectorV1Impl:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
 
-        config = lmcache_get_config()
+        self.config = lmcache_get_config()
         self.layerwise_retrievers = []
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
@@ -320,8 +343,8 @@ class LMCacheConnectorV1Impl:
                 vllm_config.scheduler_config,
             )
 
-            self.use_layerwise = config.use_layerwise
-            self.enable_blending = config.enable_blending
+            self.use_layerwise = self.config.use_layerwise
+            self.enable_blending = self.config.enable_blending
 
             if self.enable_blending:
                 self.blender = LMCBlenderBuilder.get_or_create(
@@ -355,7 +378,7 @@ class LMCacheConnectorV1Impl:
             )
         )
 
-        self._lmcache_chunk_size = config.chunk_size
+        self._lmcache_chunk_size = self.config.chunk_size
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -622,9 +645,10 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
 
         assert self.lmcache_engine is not None
-
+        # print("wait for save begin...")
         for request in connector_metadata.requests:
             save_spec = request.save_spec
+            # print("request.token_ids:",request.token_ids,",save_spec:",save_spec)
             if save_spec is None or not save_spec.can_save:
                 continue
 
@@ -682,6 +706,9 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        print("get finish req:",finished_req_ids)
+        if finished_req_ids:
+            self.wait_for_save()
         return None, None
 
     ###################
@@ -816,6 +843,22 @@ class LMCacheConnectorV1Impl:
         meta = LMCacheConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            print("finish req :",finished_req_id)
+            tracker = self._request_trackers.get(finished_req_id)
+            if tracker is not None and tracker.num_saved_tokens < len(tracker.token_ids):
+                # force save decode kvcache (remaing tokens len < chunk size)
+                req_meta = ReqMeta.from_request_tracker(
+                    self,
+                    tracker,
+                    self._block_size,
+                    self._lmcache_chunk_size,
+                    load_spec=None,
+                    skip_save=False,
+                    discard_partial_chunks=False,
+                    force_save=True
+                )
+                if req_meta is not None:
+                    meta.add_request(req_meta)
             self._request_trackers.pop(finished_req_id, None)
 
         for request in scheduler_output.scheduled_new_reqs:
@@ -836,12 +879,14 @@ class LMCacheConnectorV1Impl:
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 discard_partial_chunks=self._discard_partial_chunks,
+                force_save=False
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -857,12 +902,14 @@ class LMCacheConnectorV1Impl:
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
 
                 req_meta = ReqMeta.from_request_tracker(
+                    self,
                     request_tracker,
                     self._block_size,
                     self._lmcache_chunk_size,
                     load_spec=None,
                     skip_save=force_skip_save,
                     discard_partial_chunks=self._discard_partial_chunks,
+                    force_save=False
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -886,12 +933,14 @@ class LMCacheConnectorV1Impl:
             request_tracker.update(new_token_ids, new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
                 load_spec=None,
                 skip_save=force_skip_save,
                 discard_partial_chunks=self._discard_partial_chunks,
+                force_save=False
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
