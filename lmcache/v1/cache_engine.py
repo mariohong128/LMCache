@@ -657,8 +657,10 @@ class LMCacheEngine:
                         return old_end
                 old_end = end
             else:
+                # print("try lookup end:",end)
                 if self.storage_manager.contains(key, search_range, pin):
                     old_end = end
+                    # print("lookup an valid end:",end)
                     continue
 
                 if search_p2p:
@@ -669,6 +671,7 @@ class LMCacheEngine:
                 return old_end
 
         # all tokens where found, return the maximal end
+        # print("final lookup end:",end)
         return end
 
     @_lmcache_nvtx_annotate

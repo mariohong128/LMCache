@@ -706,8 +706,8 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        print("get finish req:",finished_req_ids)
         if finished_req_ids:
+            print("get finish req:",finished_req_ids)
             self.wait_for_save()
         return None, None
 
@@ -745,8 +745,9 @@ class LMCacheConnectorV1Impl:
             apply_mm_hashes_to_token_ids(
                 token_ids, request.mm_hashes, request.mm_positions
             )
-
+        print("get_num_new_matched_tokens start lookup")
         if self.skip_last_n_tokens > 0:
+            print("self.skip_last_n_tokens:",self.skip_last_n_tokens)
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids[: -self.skip_last_n_tokens]
             )
