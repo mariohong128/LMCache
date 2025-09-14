@@ -212,7 +212,7 @@ class LMCacheEngine:
             memory_objs.append(memory_obj)
             tot_kv_size += memory_obj.get_size()
             tot_token_num += num_tokens
-
+        logger.info(f"offload_time except batched_from_gpu:{time.perf_counter() - t}")
         self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
@@ -394,26 +394,43 @@ class LMCacheEngine:
         reordered_memory_objs = []
         reordered_starts = []
         reordered_ends = []
+
+        t_contains = 0.0
+        t_p2p = 0.0
+        t_batched_get = 0.0
+        t_batched_to_gpu = 0.0
+        t_ref_count = 0.0
+        t_remove_unpin = 0.0
+
+        # 1. contains检查和P2P拉取
+        t0 = time.perf_counter()
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
-
+            t1 = time.perf_counter()
             if key in self.lookup_cache:
                 # TODO(Jiayi): we can reduce the number of `contains` calls
                 # by checking the lookup cache first (should be updated in `lookup`)
+                logger.info("key in lookup_cache")
                 pass
             else:
                 # NOTE: key should always be in the lookup cache once
                 # we support it.
+                t2 = time.perf_counter()
                 location = self.storage_manager.contains(key)
+                t_contains += time.perf_counter() - t2
+                logger.info(f"location: {location}")
                 if location is None:
                     # TODO(Jiayi): Need to refactor P2P as a storage backend to
                     # clean up the following code.
                     if self.enable_p2p:
+                        logger.info("find in p2p")
+                        t3 = time.perf_counter()
                         future_memory_obj = asyncio.run_coroutine_threadsafe(
                             self.distributed_server.issue_get(key),
                             self.distributed_loop,
                         )
                         memory_obj = future_memory_obj.result()
+                        t_p2p += time.perf_counter() - t3
                         reordered_keys.append(key)
                         reordered_memory_objs.append(memory_obj)
                         reordered_starts.append(start)
@@ -437,31 +454,45 @@ class LMCacheEngine:
             key_mapping[location].append(key)
             start_mapping[location].append(start)
             end_mapping[location].append(end)
+        t_contains_total = time.perf_counter() - t0
+        logger.info(
+            f"[retrieve] contains检查总耗时: {t_contains_total*1000:.4f} ms, 其中storage_manager.contains耗时: {t_contains*1000:.4f} ms, P2P拉取耗时: {t_p2p*1000:.4f} ms"
+        )
 
-        # TODO(Jiayi): We can parallelize the retrieval from
-        # different storage backends.
+        # 2. batched_get
+        t4 = time.perf_counter()
         for location, keys in key_mapping.items():
+            t5 = time.perf_counter()
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 storage_backend_name=location,
             )
+            t_batched_get += time.perf_counter() - t5
             reordered_memory_objs.extend(memory_objs)
             reordered_keys.extend(keys)
             reordered_starts.extend(start_mapping[location])
             reordered_ends.extend(end_mapping[location])
+        t_batched_get_total = time.perf_counter() - t4
+        logger.info(
+            f"[retrieve] batched_get总耗时: {t_batched_get_total*1000:.4f} ms, 其中batched_get实际调用耗时: {t_batched_get*1000:.4f} ms"
+        )
 
-        # NOTE(Jiayi): memory_obj doesn't have to be a pinned
-        # cpu tensor for the sake of performance.
-        # For example, disk->gpu is faster than disk->cpu->gpu.
-        # RDMA is another example.
+        # 3. batched_to_gpu
+        t6 = time.perf_counter()
         self.gpu_connector.batched_to_gpu(
             reordered_memory_objs, reordered_starts, reordered_ends, **kwargs
         )
+        t_batched_to_gpu = time.perf_counter() - t6
+        logger.info(f"[retrieve] batched_to_gpu耗时: {t_batched_to_gpu*1000:.4f} ms")
 
-        # TODO(Jiayi): Remove the following for loop with batched operations
+        # 4. ref_count_down + remove/unpin
+        t7 = time.perf_counter()
         for key, memory_obj in zip(reordered_keys, reordered_memory_objs, strict=False):
+            t8 = time.perf_counter()
             memory_obj.ref_count_down()
+            t_ref_count += time.perf_counter() - t8
 
+            t9 = time.perf_counter()
             # NOTE (ApostaC): This is only for the current implementation:
             # When the object is retrieved back to vLLM, the storage backend
             # will immediately remove the object from itself
@@ -469,6 +500,11 @@ class LMCacheEngine:
                 self.storage_manager.remove(key)
             else:
                 self.storage_manager.batched_unpin([key])
+            t_remove_unpin += time.perf_counter() - t9
+        t_post_total = time.perf_counter() - t7
+        logger.info(
+            f"[retrieve] ref_count_down总耗时: {t_ref_count*1000:.4f} ms, remove/unpin总耗时: {t_remove_unpin*1000:.4f} ms, 合计: {t_post_total*1000:.4f} ms"
+        )
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -480,6 +516,9 @@ class LMCacheEngine:
             retrieved_tokens,
             len(tokens),
             tot_time * 1000,
+        )
+        logger.info(
+            f"[retrieve] 总耗时: {tot_time*1000:.4f} ms (包含所有阶段)"
         )
         logger.debug(
             f"Retrieved {retrieved_tokens} "

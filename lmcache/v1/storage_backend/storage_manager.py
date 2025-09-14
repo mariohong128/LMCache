@@ -244,6 +244,7 @@ class StorageManager:
         """
         Non-blocking function to get the memory objects from the storages.
         """
+        # print(f"storage_backend_name:{storage_backend_name}")
         storage_backend = self.storage_backends[storage_backend_name]
         memory_objs = storage_backend.batched_get_blocking(keys)
         return memory_objs
